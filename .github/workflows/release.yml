@@ -52,3 +52,82 @@ jobs:
         run: |
           docker push \
             ghcr.io/${{ github.repository_owner }}/${{ matrix.service }}:sha-${{ github.sha }}
+
+  promote:
+    name: Promote images to GitOps
+    needs: release
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout GitOps repository
+        uses: actions/checkout@v7
+        with:
+          repository: thaianhvu29/company-platform-gitops
+          token: ${{ secrets.GITOPS_TOKEN }}
+          ref: main
+          path: gitops
+
+      - name: Update staging image tags
+        id: promote
+        shell: bash
+        run: |
+          cd gitops
+
+          IMAGE_TAG="sha-${GITHUB_SHA}"
+          OWNER="${{ github.repository_owner }}"
+          BRANCH="promotion/sha-${GITHUB_SHA}"
+
+          sed -i -E \
+            "s#^([[:space:]]*)image: ghcr.io/${OWNER}/api-gateway:.*#\1image: ghcr.io/${OWNER}/api-gateway:${IMAGE_TAG}#" \
+            environments/staging/api-gateway/deployment.yaml
+
+          sed -i -E \
+            "s#^([[:space:]]*)image: ghcr.io/${OWNER}/order-service:.*#\1image: ghcr.io/${OWNER}/order-service:${IMAGE_TAG}#" \
+            environments/staging/order-service/deployment.yaml
+
+          sed -i -E \
+            "s#^([[:space:]]*)image: ghcr.io/${OWNER}/payment-service:.*#\1image: ghcr.io/${OWNER}/payment-service:${IMAGE_TAG}#" \
+            environments/staging/payment-service/deployment.yaml
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git checkout -b "${BRANCH}"
+
+          git add environments/staging/*/deployment.yaml
+
+          if git diff --cached --quiet; then
+            echo "No image changes required."
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          git commit -m "chore: promote application images to ${IMAGE_TAG}"
+          git push origin "${BRANCH}"
+
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+          echo "branch=${BRANCH}" >> "$GITHUB_OUTPUT"
+
+      - name: Create GitOps pull request
+        if: steps.promote.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITOPS_TOKEN }}
+          BRANCH: ${{ steps.promote.outputs.branch }}
+        run: |
+          cd gitops
+
+          gh pr create \
+            --repo "${{ github.repository_owner }}/company-platform-gitops" \
+            --base main \
+            --head "${BRANCH}" \
+            --title "chore: promote application images to sha-${GITHUB_SHA:0:7}" \
+            --body "Automated image promotion from application release.
+
+          Source commit: ${GITHUB_SHA}
+
+          Updated services:
+          - api-gateway
+          - order-service
+          - payment-service
+
+          After this PR is merged, ArgoCD will reconcile the new image versions into the staging cluster."
