@@ -1,0 +1,109 @@
+name: CI
+
+on:
+  pull_request:
+    branches:
+      - main
+
+  push:
+    branches:
+      - "feature/**"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    name: Validate - ${{ matrix.service }}
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        service:
+          - api-gateway
+          - order-service
+          - payment-service
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v7
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: ${{ matrix.service }}/package-lock.json
+
+      - name: Install dependencies
+        working-directory: ${{ matrix.service }}
+        run: npm ci
+
+      - name: Validate JavaScript syntax
+        working-directory: ${{ matrix.service }}
+        run: node --check server.js
+
+      - name: Start service
+        working-directory: ${{ matrix.service }}
+        run: |
+          node server.js > service.log 2>&1 &
+          echo $! > service.pid
+
+      - name: Wait for service
+        run: |
+          for i in {1..10}; do
+            if curl --fail --silent http://localhost:3000/health; then
+              exit 0
+            fi
+
+            echo "Waiting for ${{ matrix.service }}..."
+            sleep 2
+          done
+
+          echo "Service failed to become healthy"
+          cat "${{ matrix.service }}/service.log"
+          exit 1
+
+      - name: Verify readiness
+        run: |
+          curl \
+            --fail \
+            --silent \
+            --show-error \
+            http://localhost:3000/ready
+
+      - name: Verify metrics endpoint
+        run: |
+          curl \
+            --fail \
+            --silent \
+            --show-error \
+            http://localhost:3000/metrics > /dev/null
+
+      - name: Stop service
+        if: always()
+        working-directory: ${{ matrix.service }}
+        run: |
+          if [ -f service.pid ]; then
+            kill "$(cat service.pid)" || true
+          fi
+
+      - name: Build container image
+        run: |
+          docker build \
+            --tag company/${{ matrix.service }}:${{ github.sha }} \
+            ./${{ matrix.service }}
+
+      - name: Scan container image
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: company/${{ matrix.service }}:${{ github.sha }}
+          format: table
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          exit-code: "1"
